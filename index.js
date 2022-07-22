@@ -1,4 +1,4 @@
-import bodyParser from 'body-parser';
+import bcrypt from 'bcrypt';
 import util from 'node:util';
 import { generateKeyPair } from 'crypto';
 const generateKeyPairAsync = util.promisify(generateKeyPair)
@@ -7,6 +7,50 @@ import { MongoClient } from 'mongodb';
 import jwt from 'jsonwebtoken';
 import express from 'express';
 import fs from 'fs';
+import { v4 as uuidV4 } from 'uuid';
+
+
+const PASS_PHRASE = process.env.PASS_PHRASE ?? 'some secret';
+
+// privateKey: '-----BEGIN ENCRYPTED PRIVATE KEY-----\n' + ... + '-----END ENCRYPTED PRIVATE KEY-----\n'
+// publicKey: '-----BEGIN PUBLIC KEY-----\n' + ... + '-----END PUBLIC KEY-----\n',
+/**
+ * @returns Promise<{ publicKey, privateKey }>
+ */
+function generateRSA256KeyPair() {
+    return generateKeyPairAsync('rsa', {
+        modulusLength: 2048,
+        publicKeyEncoding: {
+            type: 'spki',
+            format: 'pem'
+        },
+        privateKeyEncoding: {
+            type: 'pkcs8',
+            format: 'pem',
+            cipher: 'aes-256-cbc',
+            passphrase: PASS_PHRASE
+        }
+    })
+}
+
+/**
+ * 
+ * @param {string} password 
+ * @returns Promise<string>
+ */
+async function encryptPassword(password) {
+    return bcrypt.hash(password, await bcrypt.genSalt(10))
+}
+
+/**
+ * 
+ * @param {string} password 
+ * @param {string} encryptedPassword 
+ * @returns Promise<boolean>
+ */
+function comparePassword(password, encryptedPassword) {
+    return bcrypt.compare(password, encryptedPassword)
+}
 
 
 (async () => {
@@ -20,21 +64,26 @@ import fs from 'fs';
  
     // publicKey = fs.readFileSync('publicKey.txt');
 
-    app.use(bodyParser.json());
+    app.use(express.json());
 
-    app.get('/refresh-key', (req, res) => {
-        res.send('Hello World!')
+    app.post('/verify-auth-token', async (req, res) => {
+        const result = await collection.findOne({ id: req.body.id }, { projection: { _id: 0, publicKey: 1 } })
+
+        let isAuthTokenValid;
+        try {
+            const validated = jwt.verify(req.body.authToken, result.publicKey)
+            isAuthTokenValid = validated.id === req.body.id
+        } catch (error) {
+            isAuthTokenValid = false
+        }
+        
+        res.send({ data: { isAuthTokenValid }})
     })
 
-    app.post('/authenticate', async (req, res) => {
-        console.log(req.body.id)
-
-
-        const result = await collection.findOne({ id: req.body.id }, { projection: { _id: 0, publicKey: 1 } })
-        console.log(result)
-        const validated = jwt.verify(req.body.token, result.publicKey)
-
-        res.send(validated)
+    app.post('/refresh-auth-token', async (req, res) => {
+        const result = await collection.findOne({ id: req.body.id }, { projection: { _id: 0, privateKey: 1 } })
+        const authToken = jwt.sign({id: req.query.id }, { key: result.privateKey, passphrase: PASS_PHRASE } , { algorithm: "RS256", expiresIn: "12h" })
+        res.send({ data: { authToken }})
     })
 
     app.get('/get-public-key', async (req, res) => {
@@ -42,31 +91,58 @@ import fs from 'fs';
         res.send({ data: { publicKey: result.publicKey } })
     })
 
-    app.get('/add-new-user', async (req, res) => {
-        if (req.query?.id) {
-            const { publicKey, privateKey } = await generateKeyPairAsync('rsa', {
-                modulusLength: 2048,
-                publicKeyEncoding: {
-                    type: 'spki',
-                    format: 'pem'
-                },
-                privateKeyEncoding: {
-                    type: 'pkcs8',
-                    format: 'pem',
-                    cipher: 'aes-256-cbc',
-                    passphrase: 'top secret'
-                }
-            })
-            
-            // privateKey: '-----BEGIN ENCRYPTED PRIVATE KEY-----\n' + ... + '-----END ENCRYPTED PRIVATE KEY-----\n'
-            // publicKey: '-----BEGIN PUBLIC KEY-----\n' + ... + '-----END PUBLIC KEY-----\n',
+    app.post('/sign-in', async (req, res) => {
+        console.log(req.body.id, typeof req.body.id)
+        const result = await collection.findOne({ id: req.body.id }, { projection: { _id: 0, publicKey: 1,  privateKey:1, password: 1} })
+        console.log(result)
+        const validated = jwt.verify(req.body.authToken, result.publicKey)
+        console.log("???")
+        console.log(req.body.password)
+        if (validated.id === req.body.id && await comparePassword(req.body.password, result.password)) {
+            const authToken = jwt.sign({id: req.body.id }, { key: result.privateKey, passphrase: PASS_PHRASE } , { algorithm: "RS256", expiresIn: "12h" })
+            res.send({ data: { authToken }})
+        } else {
+            throw new Error('failed to sign in')
+        }  
+    })
 
-            const token = jwt.sign({id: req.query.id }, { key: privateKey, passphrase: 'top secret' } , { algorithm: "RS256", expiresIn: "12h" })
-            await collection.updateOne({ id: req.query?.id }, { $set: { publicKey, privateKey, token } }, { upsert: true })
+    app.post('/sign-up', async (req, res) => {
+        const foundUser = await collection.findOne({ id: req.body.id })
+        if (foundUser) {
+            throw new Error('id is already taken')
         }
-        const result = await collection.findOne({ id: req.query?.id }, { projection: { _id: 0, token: 1 } })
 
-        res.send({ data: { token: result.token } })
+        const encryptedPassword = await encryptPassword(req.body.password)
+        const { publicKey, privateKey } = await generateRSA256KeyPair()
+
+        const authToken = jwt.sign({ id: req.body.id }, { key: privateKey, passphrase: PASS_PHRASE } , { algorithm: "RS256", expiresIn: "12h" })
+        
+        const now = new Date()
+
+        const updateOneResult = await collection.updateOne(
+            { id: req.body.id, createdAt: { $exists: false } },
+            { $set: { 
+                id: req.body.id,
+                publicKey, 
+                privateKey, 
+                password: encryptedPassword, 
+                createdAt: now,
+                updatedAt: now
+            }},
+            { upsert: true }
+        )
+
+        if (updateOneResult.matchedCount !== 0 || updateOneResult.upsertedCount !== 1) {
+            throw new Error("Sorry! Critial DB error") // logically should not happen
+        }
+
+        const cursor = collection.find({ id: req.body.id });
+        if (await cursor.next() && await cursor.hasNext()) { // checking if there're two is enough
+            await collection.deleteOne({ _id: updateOneResult.upsertedId })
+            throw new Error('Sorry, id is already taken')
+        }
+        
+        res.send({ data: { authToken } })
     })
 
     app.listen(port, () => {
