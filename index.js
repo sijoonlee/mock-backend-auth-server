@@ -8,7 +8,10 @@ import jwt from 'jsonwebtoken';
 import express from 'express';
 import fs from 'fs';
 import { v4 as uuidV4 } from 'uuid';
+import cookieParser from 'cookie-parser';
 
+import authTokenChecker from './src/middleware/authTokenChecker.js';
+import errorHandler from './src/middleware/errorHandler.js';
 
 const PASS_PHRASE = process.env.PASS_PHRASE ?? 'some secret';
 
@@ -65,6 +68,7 @@ function comparePassword(password, encryptedPassword) {
     // publicKey = fs.readFileSync('publicKey.txt');
 
     app.use(express.json());
+    app.use(cookieParser());
 
     app.post('/verify-auth-token', async (req, res) => {
         const result = await collection.findOne({ id: req.body.id }, { projection: { _id: 0, uuid: 1, publicKey: 1 } })
@@ -112,49 +116,56 @@ function comparePassword(password, encryptedPassword) {
         }
     })
 
-    app.post('/sign-up', async (req, res) => {
-        const foundUser = await collection.findOne({ id: req.body.id })
-        if (foundUser) {
-            throw new Error('id is already taken')
-        }
-
-        const encryptedPassword = await encryptPassword(req.body.password)
-        const { publicKey, privateKey } = await generateRSA256KeyPair()
-
-        const uuid = uuidV4()
-        const authToken = jwt.sign({ id: req.body.id, uuid }, { key: privateKey, passphrase: PASS_PHRASE } , { algorithm: "RS256", expiresIn: "12h" })
-        updateOneResult.upsertedId
-        const now = new Date()
-
-        const updateOneResult = await collection.updateOne(
-            { id: req.body.id, createdAt: { $exists: false } },
-            { $set: { 
-                id: req.body.id,
-                uuid,
-                publicKey, 
-                privateKey, 
-                password: encryptedPassword, 
-                createdAt: now,
-                updatedAt: now
-            }},
-            { upsert: true }
-        )
-
-        if (updateOneResult.matchedCount !== 0 || updateOneResult.upsertedCount !== 1) {
-            throw new Error("Sorry! Critial DB error") // logically should not happen
-        }
-
-        const cursor = collection.find({ id: req.body.id });
-        if (await cursor.next() && await cursor.hasNext()) { // checking if there're two is enough
-            await collection.deleteOne({ _id: updateOneResult.upsertedId })
-            throw new Error('Sorry, id is already taken')
+    app.post('/sign-up', 
+    authTokenChecker,
+    async (req, res, next) => {
+        try {
+            const foundUser = await collection.findOne({ id: req.body.id })
+            if (foundUser) {
+                next(new Error('id is already taken'))
+            }
+    
+            const encryptedPassword = await encryptPassword(req.body.password)
+            const { publicKey, privateKey } = await generateRSA256KeyPair()
+    
+            const uuid = uuidV4()
+            const authToken = jwt.sign({ id: req.body.id, uuid }, { key: privateKey, passphrase: PASS_PHRASE } , { algorithm: "RS256", expiresIn: "12h" })
+    
+            const now = new Date()
+    
+            const updateOneResult = await collection.updateOne(
+                { id: req.body.id, createdAt: { $exists: false } },
+                { $set: { 
+                    id: req.body.id,
+                    uuid,
+                    publicKey, 
+                    privateKey, 
+                    password: encryptedPassword, 
+                    createdAt: now,
+                    updatedAt: now
+                }},
+                { upsert: true }
+            )
+    
+            if (updateOneResult.matchedCount !== 0 || updateOneResult.upsertedCount !== 1) {
+                throw new Error("Sorry! Critial DB error") // logically should not happen
+            }
+    
+            const cursor = collection.find({ id: req.body.id });
+            if (await cursor.next() && await cursor.hasNext()) { // checking if there're two is enough
+                await collection.deleteOne({ _id: updateOneResult.upsertedId })
+                throw new Error('Sorry, id is already taken')
+            }
+            
+            res.send({ data: { authToken } })
+        } catch (error) {
+            next(error)
         }
         
-        res.send({ data: { authToken } })
-    })
+    }, errorHandler)
 
     app.listen(port, () => {
-    console.log(`Example app listening on port ${port}`)
+        console.log(`Example app listening on port ${port}`)
     })
 })();
 
