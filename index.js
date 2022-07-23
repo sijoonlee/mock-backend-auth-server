@@ -67,12 +67,12 @@ function comparePassword(password, encryptedPassword) {
     app.use(express.json());
 
     app.post('/verify-auth-token', async (req, res) => {
-        const result = await collection.findOne({ id: req.body.id }, { projection: { _id: 0, publicKey: 1 } })
+        const result = await collection.findOne({ id: req.body.id }, { projection: { _id: 0, uuid: 1, publicKey: 1 } })
 
         let isAuthTokenValid;
         try {
             const validated = jwt.verify(req.body.authToken, result.publicKey)
-            isAuthTokenValid = validated.id === req.body.id
+            isAuthTokenValid = validated.id === req.body.id && validated.id === result.uuid
         } catch (error) {
             isAuthTokenValid = false
         }
@@ -80,30 +80,36 @@ function comparePassword(password, encryptedPassword) {
         res.send({ data: { isAuthTokenValid }})
     })
 
-    app.post('/refresh-auth-token', async (req, res) => {
-        const result = await collection.findOne({ id: req.body.id }, { projection: { _id: 0, privateKey: 1 } })
-        const authToken = jwt.sign({id: req.query.id }, { key: result.privateKey, passphrase: PASS_PHRASE } , { algorithm: "RS256", expiresIn: "12h" })
-        res.send({ data: { authToken }})
-    })
-
     app.get('/get-public-key', async (req, res) => {
         const result = await collection.findOne({ id: req.query.id }, { projection: { _id: 0, publicKey: 1 } })
         res.send({ data: { publicKey: result.publicKey } })
     })
 
-    app.post('/sign-in', async (req, res) => {
-        console.log(req.body.id, typeof req.body.id)
-        const result = await collection.findOne({ id: req.body.id }, { projection: { _id: 0, publicKey: 1,  privateKey:1, password: 1} })
-        console.log(result)
+    // renew auth token without checking password - only possible when auth token has not been expired
+    app.post('/refresh-auth-token', async (req, res) => {
+        const result = await collection.findOne({ id: req.body.id }, { projection: { _id: 0, uuid: 1, publicKey: 1,  privateKey:1, password: 1} })
+        
+        // TODO: put authToken to cookie or header and use middleware for authToken
         const validated = jwt.verify(req.body.authToken, result.publicKey)
-        console.log("???")
-        console.log(req.body.password)
-        if (validated.id === req.body.id && await comparePassword(req.body.password, result.password)) {
+        if (validated.id === req.body.id && validated.uuid === result.uuid) {
             const authToken = jwt.sign({id: req.body.id }, { key: result.privateKey, passphrase: PASS_PHRASE } , { algorithm: "RS256", expiresIn: "12h" })
             res.send({ data: { authToken }})
         } else {
             throw new Error('failed to sign in')
         }  
+    })
+
+    // check password and make new auth token
+    app.post('/sign-in', async (req, res) => {
+        const result = await collection.findOne({ id: req.body.id }, { projection: { _id: 0, uuid: 1, publicKey: 1,  privateKey:1, password: 1} })
+        if (result && await comparePassword(req.body.password, result.password)) {
+            const uuid = uuidV4()
+            const updateOneResult = await collection.updateOne({ id: req.body.id, uuid: result.uuid }, {$set: { uuid } }) // update uuid
+            const authToken = jwt.sign({id: req.query.id, uuid }, { key: result.privateKey, passphrase: PASS_PHRASE } , { algorithm: "RS256", expiresIn: "12h" })
+            res.send({ data: { authToken }})
+        } else {
+            throw new Error('user does not exist or wrong password')
+        }
     })
 
     app.post('/sign-up', async (req, res) => {
@@ -115,14 +121,16 @@ function comparePassword(password, encryptedPassword) {
         const encryptedPassword = await encryptPassword(req.body.password)
         const { publicKey, privateKey } = await generateRSA256KeyPair()
 
-        const authToken = jwt.sign({ id: req.body.id }, { key: privateKey, passphrase: PASS_PHRASE } , { algorithm: "RS256", expiresIn: "12h" })
-        
+        const uuid = uuidV4()
+        const authToken = jwt.sign({ id: req.body.id, uuid }, { key: privateKey, passphrase: PASS_PHRASE } , { algorithm: "RS256", expiresIn: "12h" })
+        updateOneResult.upsertedId
         const now = new Date()
 
         const updateOneResult = await collection.updateOne(
             { id: req.body.id, createdAt: { $exists: false } },
             { $set: { 
                 id: req.body.id,
+                uuid,
                 publicKey, 
                 privateKey, 
                 password: encryptedPassword, 
